@@ -1,0 +1,156 @@
+# Shadow Deployment Strategy using Istio Traffic Mirroring
+# Production Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-production
+  labels:
+    app: aceest-fitness
+    version: production
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: production
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: production
+    spec:
+      containers:
+      - name: aceest-fitness
+        image: docker.io/aceest-fitness:v1.2.3
+        ports:
+        - containerPort: 8000
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+---
+# Shadow Deployment (receives mirrored traffic for testing)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-shadow
+  labels:
+    app: aceest-fitness
+    version: shadow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: shadow
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: shadow
+    spec:
+      containers:
+      - name: aceest-fitness
+        image: docker.io/aceest-fitness:v1.3.0
+        ports:
+        - containerPort: 8000
+        env:
+        - name: LOG_LEVEL
+          value: "DEBUG"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+---
+# Production Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-production
+  labels:
+    app: aceest-fitness
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: aceest-fitness
+    version: production
+---
+# Shadow Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-shadow
+  labels:
+    app: aceest-fitness
+spec:
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: aceest-fitness
+    version: shadow
+---
+# Istio VirtualService with Traffic Mirroring (requires Istio)
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: aceest-fitness-shadow
+spec:
+  hosts:
+  - aceest-fitness-production
+  http:
+  - route:
+    - destination:
+        host: aceest-fitness-production
+        port:
+          number: 8000
+      weight: 100
+    mirror:
+      host: aceest-fitness-shadow
+      port:
+        number: 8000
+    mirrorPercentage:
+      value: 100.0  # Mirror 100% of traffic to shadow deployment
+
+# Note: Shadow deployment responses are discarded
+# Only production responses are returned to users
+# Use shadow deployment for:
+# - Testing new versions with real traffic patterns
+# - Performance testing under production load
+# - Validating new features without user impact

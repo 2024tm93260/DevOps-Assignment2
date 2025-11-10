@@ -1,0 +1,362 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-version-a
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: version-a
+    deployment-strategy: ab-testing
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: version-a
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: version-a
+        release: v1.2.3
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.2.3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: VERSION
+          value: "version-a-v1.2.3"
+        - name: AB_VERSION
+          value: "A"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-version-b
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: version-b
+    deployment-strategy: ab-testing
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: version-b
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: version-b
+        release: v1.3.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        deployment.kubernetes.io/note: "A/B Testing - Version B with new features"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.3.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: VERSION
+          value: "version-b-v1.3.0"
+        - name: AB_VERSION
+          value: "B"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-service
+  namespace: default
+  labels:
+    app: aceest-fitness
+    deployment-strategy: ab-testing
+spec:
+  type: LoadBalancer
+  selector:
+    app: aceest-fitness
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+---
+# Istio VirtualService for A/B Testing
+# NOTE: Requires Istio service mesh to be installed
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: aceest-fitness-ab
+  namespace: default
+spec:
+  hosts:
+  - aceest-fitness-service
+  http:
+  # Route 1: Beta testers get Version B (based on header)
+  - match:
+    - headers:
+        user-type:
+          exact: beta-tester
+    route:
+    - destination:
+        host: aceest-fitness-service
+        subset: version-b
+  # Route 2: Premium users get Version B (based on header)
+  - match:
+    - headers:
+        user-tier:
+          exact: premium
+    route:
+    - destination:
+        host: aceest-fitness-service
+        subset: version-b
+  # Route 3: Default traffic split (50/50)
+  - route:
+    - destination:
+        host: aceest-fitness-service
+        subset: version-a
+      weight: 50
+    - destination:
+        host: aceest-fitness-service
+        subset: version-b
+      weight: 50
+    timeout: 10s
+    retries:
+      attempts: 3
+      perTryTimeout: 3s
+---
+# Istio DestinationRule defining version subsets
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: aceest-fitness-destination
+  namespace: default
+spec:
+  host: aceest-fitness-service
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 100
+    loadBalancer:
+      simple: ROUND_ROBIN
+  subsets:
+  - name: version-a
+    labels:
+      version: version-a
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+  - name: version-b
+    labels:
+      version: version-b
+    trafficPolicy:
+      loadBalancer:
+        simple: ROUND_ROBIN
+---
+# ConfigMap with A/B testing management scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ab-testing-scripts
+  namespace: default
+data:
+  README.md: |
+    # A/B Testing Deployment Strategy
+    
+    ## Overview
+    A/B testing splits traffic between two versions to compare
+    user behavior, conversion rates, and feature performance.
+    
+    ## Traffic Routing Rules
+    1. Beta testers (header: user-type=beta-tester) → Version B
+    2. Premium users (header: user-tier=premium) → Version B
+    3. Default users → 50% Version A, 50% Version B
+    
+    ## Testing with Headers
+    ```bash
+    # Test Version A (default user)
+    curl http://SERVICE_IP/
+    
+    # Test Version B (beta tester)
+    curl -H "user-type: beta-tester" http://SERVICE_IP/
+    
+    # Test Version B (premium user)
+    curl -H "user-tier: premium" http://SERVICE_IP/
+    ```
+    
+    ## Adjust Traffic Split
+    Edit the VirtualService weights in k8s-ab-testing.yml:
+    - 70/30 split: version-a weight=70, version-b weight=30
+    - 90/10 split: version-a weight=90, version-b weight=10
+    
+    ## Metrics to Track
+    - Conversion rates per version
+    - User engagement metrics
+    - Error rates and latency
+    - Feature adoption rates
+    
+    ## Promote Winner
+    Once Version B proves superior:
+    ```bash
+    kubectl set image deployment/aceest-fitness-version-a aceest-fitness=2024tm93122/aceest-fitness:v1.3.0
+    kubectl delete deployment aceest-fitness-version-b
+    ```
+    
+  test-version-a.sh: |
+    #!/bin/bash
+    SERVICE_IP=$(kubectl get service aceest-fitness-service -n default -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    if [ -z "$SERVICE_IP" ]; then
+      SERVICE_IP="localhost"
+    fi
+    
+    echo "Testing Version A (default routing)..."
+    for i in {1..10}; do
+      curl -s http://$SERVICE_IP/ | grep -o "version.*" || echo "Request $i"
+      sleep 0.5
+    done
+    
+  test-version-b.sh: |
+    #!/bin/bash
+    SERVICE_IP=$(kubectl get service aceest-fitness-service -n default -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+    if [ -z "$SERVICE_IP" ]; then
+      SERVICE_IP="localhost"
+    fi
+    
+    echo "Testing Version B (beta tester routing)..."
+    for i in {1..10}; do
+      curl -s -H "user-type: beta-tester" http://$SERVICE_IP/ | grep -o "version.*" || echo "Request $i"
+      sleep 0.5
+    done
+    
+  adjust-split.sh: |
+    #!/bin/bash
+    # Adjust traffic split between versions
+    VERSION_A_WEIGHT=${1:-50}
+    VERSION_B_WEIGHT=$((100 - VERSION_A_WEIGHT))
+    
+    echo "Adjusting traffic split: A=$VERSION_A_WEIGHT%, B=$VERSION_B_WEIGHT%"
+    
+    kubectl patch virtualservice aceest-fitness-ab -n default --type='json' -p='[
+      {
+        "op": "replace",
+        "path": "/spec/http/2/route/0/weight",
+        "value": '$VERSION_A_WEIGHT'
+      },
+      {
+        "op": "replace",
+        "path": "/spec/http/2/route/1/weight",
+        "value": '$VERSION_B_WEIGHT'
+      }
+    ]'
+    
+    echo "Traffic split updated successfully"
+    
+  check-distribution.sh: |
+    #!/bin/bash
+    echo "=== Version A Status ==="
+    kubectl get deployment aceest-fitness-version-a -n default
+    kubectl get pods -l version=version-a -n default
+    
+    echo ""
+    echo "=== Version B Status ==="
+    kubectl get deployment aceest-fitness-version-b -n default
+    kubectl get pods -l version=version-b -n default
+    
+    echo ""
+    echo "=== Current VirtualService Configuration ==="
+    kubectl get virtualservice aceest-fitness-ab -n default -o yaml | grep -A 10 "route:"

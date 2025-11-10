@@ -1,0 +1,247 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-blue
+  namespace: default
+  labels:
+    app: aceest-fitness
+    environment: blue
+    deployment-strategy: blue-green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      environment: blue
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        environment: blue
+        version: v1.2.3
+      annotations:
+        deployment.kubernetes.io/revision: "1"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.2.3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: ENVIRONMENT
+          value: "blue"
+        - name: VERSION
+          value: "v1.2.3"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-green
+  namespace: default
+  labels:
+    app: aceest-fitness
+    environment: green
+    deployment-strategy: blue-green
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      environment: green
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        environment: green
+        version: v1.3.0
+      annotations:
+        deployment.kubernetes.io/revision: "2"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.3.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: ENVIRONMENT
+          value: "green"
+        - name: VERSION
+          value: "v1.3.0"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-service
+  namespace: default
+  labels:
+    app: aceest-fitness
+    deployment-strategy: blue-green
+spec:
+  type: LoadBalancer
+  selector:
+    app: aceest-fitness
+    environment: blue  # Change to 'green' to switch traffic
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+---
+# Internal services for testing each environment
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-blue-internal
+  namespace: default
+  labels:
+    app: aceest-fitness
+    environment: blue
+spec:
+  type: ClusterIP
+  selector:
+    app: aceest-fitness
+    environment: blue
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-green-internal
+  namespace: default
+  labels:
+    app: aceest-fitness
+    environment: green
+spec:
+  type: ClusterIP
+  selector:
+    app: aceest-fitness
+    environment: green
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+---
+# ConfigMap with switch instructions
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blue-green-instructions
+  namespace: default
+data:
+  switch-to-green.sh: |
+    #!/bin/bash
+    # Switch traffic to green deployment
+    kubectl patch service aceest-fitness-service -n default -p '{"spec":{"selector":{"environment":"green"}}}'
+    echo "Traffic switched to GREEN environment (v1.3.0)"
+    
+  switch-to-blue.sh: |
+    #!/bin/bash
+    # Rollback traffic to blue deployment
+    kubectl patch service aceest-fitness-service -n default -p '{"spec":{"selector":{"environment":"blue"}}}'
+    echo "Traffic switched to BLUE environment (v1.2.3)"
+    
+  test-green.sh: |
+    #!/bin/bash
+    # Test green environment before switching
+    GREEN_IP=$(kubectl get service aceest-fitness-green-internal -n default -o jsonpath='{.spec.clusterIP}')
+    echo "Testing green environment at $GREEN_IP:8000"
+    kubectl run test-pod --rm -it --image=curlimages/curl --restart=Never -- curl -s http://$GREEN_IP:8000/health
+    
+  verify-switch.sh: |
+    #!/bin/bash
+    # Verify which environment is active
+    ACTIVE_ENV=$(kubectl get service aceest-fitness-service -n default -o jsonpath='{.spec.selector.environment}')
+    echo "Current active environment: $ACTIVE_ENV"

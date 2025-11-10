@@ -1,0 +1,338 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-production
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: production
+    deployment-strategy: shadow
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: production
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: production
+        release: v1.2.3
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.2.3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: VERSION
+          value: "production-v1.2.3"
+        - name: DEPLOYMENT_TYPE
+          value: "production"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-shadow
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: shadow
+    deployment-strategy: shadow
+spec:
+  replicas: 1  # Lower replica count for shadow testing
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: shadow
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: shadow
+        release: v1.3.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        deployment.kubernetes.io/note: "Shadow deployment - receives mirrored traffic for testing"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.3.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: VERSION
+          value: "shadow-v1.3.0"
+        - name: DEPLOYMENT_TYPE
+          value: "shadow"
+        - name: LOG_LEVEL
+          value: "DEBUG"  # Enhanced logging for shadow testing
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-production
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: production
+spec:
+  type: LoadBalancer
+  selector:
+    app: aceest-fitness
+    version: production
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-shadow
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: shadow
+spec:
+  type: ClusterIP
+  selector:
+    app: aceest-fitness
+    version: shadow
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+---
+# Istio VirtualService for Traffic Mirroring
+# NOTE: Requires Istio service mesh to be installed
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: aceest-fitness-shadow
+  namespace: default
+spec:
+  hosts:
+  - aceest-fitness-production
+  http:
+  - route:
+    - destination:
+        host: aceest-fitness-production
+        port:
+          number: 80
+      weight: 100
+    mirror:
+      host: aceest-fitness-shadow
+      port:
+        number: 8000
+    mirrorPercentage:
+      value: 100.0  # Mirror 100% of production traffic to shadow
+    timeout: 10s
+    retries:
+      attempts: 3
+      perTryTimeout: 3s
+---
+# Istio DestinationRule for production service
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: aceest-fitness-production-dr
+  namespace: default
+spec:
+  host: aceest-fitness-production
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 50
+        http2MaxRequests: 100
+        maxRequestsPerConnection: 2
+    loadBalancer:
+      simple: ROUND_ROBIN
+    outlierDetection:
+      consecutiveErrors: 5
+      interval: 30s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+---
+# Istio DestinationRule for shadow service
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: aceest-fitness-shadow-dr
+  namespace: default
+spec:
+  host: aceest-fitness-shadow
+  trafficPolicy:
+    connectionPool:
+      tcp:
+        maxConnections: 50
+      http:
+        http1MaxPendingRequests: 25
+        http2MaxRequests: 50
+    loadBalancer:
+      simple: ROUND_ROBIN
+---
+# ConfigMap with shadow deployment instructions
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: shadow-deployment-guide
+  namespace: default
+data:
+  README.md: |
+    # Shadow Deployment Strategy
+    
+    ## Overview
+    Shadow deployment mirrors production traffic to a shadow environment
+    for testing without impacting users. Responses from shadow are discarded.
+    
+    ## Prerequisites
+    - Istio service mesh installed and configured
+    - Prometheus for monitoring (optional but recommended)
+    
+    ## Setup
+    1. Deploy this configuration:
+       kubectl apply -f k8s-shadow.yml
+    
+    2. Verify Istio injection:
+       kubectl get pods -n default --show-labels
+    
+    3. Check traffic mirroring:
+       kubectl logs -l version=shadow -n default
+    
+    ## Monitoring
+    - Production logs: kubectl logs -l version=production -n default
+    - Shadow logs: kubectl logs -l version=shadow -n default
+    - Compare error rates, latencies, and behavior
+    
+    ## Promote Shadow to Production
+    Once shadow testing is complete:
+    1. Update production image:
+       kubectl set image deployment/aceest-fitness-production aceest-fitness=2024tm93122/aceest-fitness:v1.3.0
+    2. Remove shadow deployment:
+       kubectl delete deployment aceest-fitness-shadow
+       kubectl delete service aceest-fitness-shadow
+    
+    ## Benefits
+    - Zero risk to production users
+    - Test with real production traffic patterns
+    - Validate performance under load
+    - Compare behavior side-by-side
+    
+  check-shadow-health.sh: |
+    #!/bin/bash
+    echo "=== Production Deployment Health ==="
+    kubectl get deployment aceest-fitness-production -n default
+    kubectl get pods -l version=production -n default
+    
+    echo ""
+    echo "=== Shadow Deployment Health ==="
+    kubectl get deployment aceest-fitness-shadow -n default
+    kubectl get pods -l version=shadow -n default
+    
+    echo ""
+    echo "=== Recent Shadow Logs ==="
+    kubectl logs -l version=shadow -n default --tail=50
+    
+  compare-metrics.sh: |
+    #!/bin/bash
+    # Compare metrics between production and shadow
+    echo "This script requires Prometheus to be installed"
+    echo "Query production response times:"
+    echo "  histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{version=\"production\"}[5m]))"
+    echo ""
+    echo "Query shadow response times:"
+    echo "  histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{version=\"shadow\"}[5m]))"

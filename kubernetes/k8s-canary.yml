@@ -1,0 +1,264 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-stable
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: stable
+    deployment-strategy: canary
+spec:
+  replicas: 9  # 90% of traffic (9 out of 10 pods)
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: stable
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: stable
+        release: v1.2.3
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.2.3
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: VERSION
+          value: "stable-v1.2.3"
+        - name: DEPLOYMENT_TYPE
+          value: "stable"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aceest-fitness-canary
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: canary
+    deployment-strategy: canary
+spec:
+  replicas: 1  # 10% of traffic (1 out of 10 pods)
+  selector:
+    matchLabels:
+      app: aceest-fitness
+      version: canary
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: aceest-fitness
+        version: canary
+        release: v1.3.0
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        deployment.kubernetes.io/note: "Canary deployment receiving 10% traffic"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: aceest-fitness
+        image: 2024tm93122/aceest-fitness:v1.3.0
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: FLASK_ENV
+          value: "production"
+        - name: VERSION
+          value: "canary-v1.3.0"
+        - name: DEPLOYMENT_TYPE
+          value: "canary"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-service
+  namespace: default
+  labels:
+    app: aceest-fitness
+    deployment-strategy: canary
+spec:
+  type: LoadBalancer
+  selector:
+    app: aceest-fitness  # Routes to both stable and canary based on replica count
+  ports:
+  - port: 80
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  sessionAffinity: None  # Disable session affinity for random distribution
+---
+# Separate services for monitoring each deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-stable-monitoring
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: stable
+spec:
+  type: ClusterIP
+  selector:
+    app: aceest-fitness
+    version: stable
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aceest-fitness-canary-monitoring
+  namespace: default
+  labels:
+    app: aceest-fitness
+    version: canary
+spec:
+  type: ClusterIP
+  selector:
+    app: aceest-fitness
+    version: canary
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+---
+# ConfigMap with canary management scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: canary-management-scripts
+  namespace: default
+data:
+  increase-canary.sh: |
+    #!/bin/bash
+    # Gradually increase canary traffic
+    CANARY_REPLICAS=${1:-2}
+    STABLE_REPLICAS=$((10 - CANARY_REPLICAS))
+    
+    echo "Scaling to: Stable=$STABLE_REPLICAS, Canary=$CANARY_REPLICAS"
+    kubectl scale deployment aceest-fitness-stable -n default --replicas=$STABLE_REPLICAS
+    kubectl scale deployment aceest-fitness-canary -n default --replicas=$CANARY_REPLICAS
+    echo "Canary now receiving approximately $((CANARY_REPLICAS * 10))% of traffic"
+    
+  promote-canary.sh: |
+    #!/bin/bash
+    # Promote canary to stable
+    echo "Promoting canary v1.3.0 to stable..."
+    kubectl set image deployment/aceest-fitness-stable -n default aceest-fitness=2024tm93122/aceest-fitness:v1.3.0
+    kubectl scale deployment aceest-fitness-stable -n default --replicas=10
+    kubectl scale deployment aceest-fitness-canary -n default --replicas=0
+    echo "Canary promoted successfully"
+    
+  rollback-canary.sh: |
+    #!/bin/bash
+    # Rollback canary deployment
+    echo "Rolling back canary deployment..."
+    kubectl scale deployment aceest-fitness-canary -n default --replicas=0
+    kubectl scale deployment aceest-fitness-stable -n default --replicas=10
+    echo "Canary rolled back, 100% traffic on stable"
+    
+  check-status.sh: |
+    #!/bin/bash
+    # Check canary deployment status
+    STABLE_REPLICAS=$(kubectl get deployment aceest-fitness-stable -n default -o jsonpath='{.status.readyReplicas}')
+    CANARY_REPLICAS=$(kubectl get deployment aceest-fitness-canary -n default -o jsonpath='{.status.readyReplicas}')
+    TOTAL=$((STABLE_REPLICAS + CANARY_REPLICAS))
+    
+    if [ $TOTAL -gt 0 ]; then
+      CANARY_PERCENT=$((CANARY_REPLICAS * 100 / TOTAL))
+      echo "Stable: $STABLE_REPLICAS replicas ($(( 100 - CANARY_PERCENT ))%)"
+      echo "Canary: $CANARY_REPLICAS replicas ($CANARY_PERCENT%)"
+    else
+      echo "No pods running"
+    fi

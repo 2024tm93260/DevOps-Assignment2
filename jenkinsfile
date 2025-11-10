@@ -1,0 +1,134 @@
+pipeline {
+    agent any
+
+    environment {
+        // Change this to your DockerHub repo (or Docker registry repo) if different
+        IMAGE_NAME = "2024tm93122/aceest-fitness"
+        // Optional: build context override (backend or repo root). We'll build backend image by default.
+        BACKEND_DIR = "backend"
+        BACKEND_DOCKERFILE = "backend/Dockerfile"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout([$class: 'GitSCM',
+                    branches: [[name: '*/main']],                // change branch if needed
+                    userRemoteConfigs: [[
+                        url: 'https://github.com/2024tm93122/aceest-fitness.git',
+                        credentialsId: 'github-https-token'    // ensure this credential exists in Jenkins
+                    ]]
+                ])
+            }
+        }
+
+        stage('Install & Test - Backend') {
+            steps {
+                script {
+                    sh '''
+                        set -e
+
+                        # Use repo backend folder (adapt if your project layout differs)
+                        cd ${BACKEND_DIR}
+
+                        # create virtualenv and activate
+                        python3 -m venv .venv
+                        . .venv/bin/activate
+
+                        pip install --upgrade pip
+                        if [ -f requirements.txt ]; then
+                          pip install --no-cache-dir -r requirements.txt
+                        fi
+
+                        # Ensure tests path - adjust if tests live elsewhere
+                        if [ -d tests ]; then
+                          pytest tests --maxfail=1 --disable-warnings -q
+                        else
+                          echo "No backend tests directory found at ${PWD}/tests"
+                        fi
+
+                        deactivate
+                    '''
+                }
+            }
+        }
+
+        stage('Install & Test - Frontend (optional)') {
+            steps {
+                script {
+                    sh '''
+                        set -e
+                        if [ -d frontend ]; then
+                          cd frontend
+                          # Install dependencies and run frontend tests (optional)
+                          if [ -f package.json ]; then
+                            npm ci
+                            # run tests if defined
+                            if npm test --silent --version >/dev/null 2>&1; then
+                              npm test -- --watchAll=false || echo "Frontend tests failed (non-blocking)."
+                            fi
+                          fi
+                        else
+                          echo "No frontend directory - skipping frontend tests"
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Prepare') {
+            steps {
+                script {
+                    env.GIT_HASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_HASH}"
+                    echo "Docker Image Tag: ${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Docker Build & Push') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-token',
+                    usernameVariable: 'DOCKER_USER',
+                    passwordVariable: 'DOCKER_PASS'
+                )]) {
+                    sh '''
+                        set -e
+                        echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+
+                        # Option A: Build backend image (recommended if backend is the deployable service)
+                        if [ -f ${BACKEND_DOCKERFILE} ]; then
+                          docker build -f ${BACKEND_DOCKERFILE} -t ${IMAGE_NAME}:${IMAGE_TAG} ${BACKEND_DIR}
+                        else
+                          # Fallback: build from repo root if no backend Dockerfile found
+                          docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .
+                        fi
+
+                        # Push the uniquely tagged image
+                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
+
+                        # Optionally tag 'latest' (uncomment if desired)
+                        # docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest
+                        # docker push ${IMAGE_NAME}:latest
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                # best-effort cleanup and logout
+                docker logout || true
+            '''
+        }
+        success {
+            echo "Pipeline succeeded. Image pushed: ${IMAGE_NAME}:${IMAGE_TAG}"
+        }
+        failure {
+            echo "Pipeline failed. Check logs."
+        }
+    }
+}
