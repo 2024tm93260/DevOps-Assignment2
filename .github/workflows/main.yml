@@ -1,43 +1,439 @@
-name: CI
+name: ACEest Fitness CI/CD Pipeline
+
 on:
   push:
-    branches: ["**"]
+    branches: 
+      - "**"
+    tags:
+      - 'v*'
   pull_request:
-    branches: ["**"]
+    branches: 
+      - "**"
+  workflow_dispatch:
+
+env:
+  DOCKER_IMAGE: 2024tm93122/aceest-fitness
+  PYTHON_VERSION: "3.11"
+
 jobs:
-  tests:
+  # ==================== Code Quality & Linting ====================
+  lint:
+    name: Code Quality Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-      - run: |
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install linting dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 black pylint
+
+      - name: Run Black formatter check
+        run: |
+          black --check --diff app/ tests/ || echo "Black formatting issues found (non-blocking)"
+        continue-on-error: true
+
+      - name: Run Flake8
+        run: |
+          flake8 app/ tests/ --max-line-length=120 --extend-ignore=E203,W503 || echo "Flake8 issues found (non-blocking)"
+        continue-on-error: true
+
+  # ==================== Unit Tests ====================
+  tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      - run: pytest -q
-  docker-build-and-smoke:
+          pip install pytest pytest-cov
+
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v --cov=app --cov-report=xml --cov-report=term --cov-report=html
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+      - name: Upload coverage reports to Codecov
+        if: matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false
+        continue-on-error: true
+
+      - name: Upload coverage artifact
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            htmlcov/
+            coverage.xml
+          retention-days: 7
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: |
+            coverage.xml
+            .coverage
+          retention-days: 7
+
+  # ==================== Security Scanning ====================
+  security:
+    name: Security Scan
     runs-on: ubuntu-latest
     needs: tests
     steps:
-      - uses: actions/checkout@v4
-      - run: docker build -t aceest-fitness:ci .
-      - run: docker run -d -p 8000:8000 --name web aceest-fitness:ci
-      - run: |
-          for i in {1..20}; do
-            if curl -fsS http://localhost:8000/health >/dev/null; then
-              echo "App is up"; break
-            fi
-            sleep 1
-          done
-      - run: |
-          curl -fsS http://localhost:8000/health
-          curl -fsS -X POST http://localhost:8000/workouts \
-            -H 'Content-Type: application/json' \
-            -d '{"category":"Workout","workout":"Running","duration":25}'
-          curl -fsS http://localhost:8000/workouts
-          curl -fsS http://localhost:8000/summary
-          curl -fsS http://localhost:8000/ui
-      - if: failure()
-        run: docker logs web
+      - name: Checkout code
+        uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install safety bandit
+
+      - name: Run Safety check (dependency vulnerabilities)
+        run: |
+          safety check --json || echo "Safety check found issues (non-blocking)"
+        continue-on-error: true
+
+      - name: Run Bandit security scan
+        run: |
+          bandit -r app/ -f json -o bandit-report.json || echo "Bandit found issues (non-blocking)"
+        continue-on-error: true
+
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            bandit-report.json
+          retention-days: 30
+
+  # ==================== Docker Build & Test ====================
+  docker-build-and-smoke:
+    name: Docker Build & Smoke Tests
+    runs-on: ubuntu-latest
+    needs: tests
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Build Docker image
+        run: |
+          docker build \
+            --tag ${{ env.DOCKER_IMAGE }}:ci-${{ github.sha }} \
+            --tag ${{ env.DOCKER_IMAGE }}:ci-latest \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            .
+
+      - name: Start container
+        run: |
+          docker run -d \
+            --name aceest-fitness-test \
+            -p 8000:8000 \
+            --health-cmd="curl -f http://localhost:8000/health || exit 1" \
+            --health-interval=10s \
+            --health-timeout=5s \
+            --health-retries=5 \
+            ${{ env.DOCKER_IMAGE }}:ci-${{ github.sha }}
+
+      - name: Wait for container to be healthy
+        run: |
+          echo "Waiting for container to be healthy..."
+          for i in {1..30}; do
+            if docker inspect --format='{{.State.Health.Status}}' aceest-fitness-test | grep -q "healthy"; then
+              echo "Container is healthy!"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Container failed to become healthy"
+              docker logs aceest-fitness-test
+              exit 1
+            fi
+            echo "Attempt $i/30: Container not healthy yet, waiting..."
+            sleep 2
+          done
+
+      - name: Run smoke tests
+        run: |
+          echo "=== Running Smoke Tests ==="
+          
+          # Test 1: Health check
+          echo "Test 1: Health check endpoint"
+          curl -f -s http://localhost:8000/health || exit 1
+          
+          # Test 2: Root endpoint
+          echo "Test 2: Root endpoint"
+          curl -f -s http://localhost:8000/ || exit 1
+          
+          # Test 3: Add workout
+          echo "Test 3: Add workout"
+          curl -f -s -X POST http://localhost:8000/workouts \
+            -H 'Content-Type: application/json' \
+            -d '{"category":"Workout","workout":"Running","duration":25}' || exit 1
+          
+          # Test 4: List workouts
+          echo "Test 4: List workouts"
+          WORKOUTS=$(curl -f -s http://localhost:8000/workouts)
+          echo "$WORKOUTS" | grep -q "Running" || exit 1
+          
+          # Test 5: Get summary
+          echo "Test 5: Get summary"
+          SUMMARY=$(curl -f -s http://localhost:8000/summary)
+          echo "$SUMMARY" | grep -q "total_time" || exit 1
+          
+          # Test 6: UI endpoint
+          echo "Test 6: UI endpoint"
+          curl -f -s http://localhost:8000/ui | grep -q "ACEest" || exit 1
+          
+          # Test 7: Multiple workouts
+          echo "Test 7: Add multiple workouts"
+          curl -f -s -X POST http://localhost:8000/workouts \
+            -H 'Content-Type: application/json' \
+            -d '{"category":"Warm-up","workout":"Stretching","duration":10}' || exit 1
+          curl -f -s -X POST http://localhost:8000/workouts \
+            -H 'Content-Type: application/json' \
+            -d '{"category":"Cool-down","workout":"Walking","duration":15}' || exit 1
+          
+          # Test 8: Verify count
+          echo "Test 8: Verify workout count"
+          COUNT=$(curl -f -s http://localhost:8000/workouts | grep -o '"count":[0-9]*' | cut -d':' -f2)
+          if [ "$COUNT" -ne 3 ]; then
+            echo "Expected 3 workouts, got $COUNT"
+            exit 1
+          fi
+          
+          echo "=== All smoke tests passed! ==="
+
+      - name: Check container logs
+        if: always()
+        run: |
+          echo "=== Container Logs ==="
+          docker logs aceest-fitness-test
+
+      - name: Stop container
+        if: always()
+        run: |
+          docker stop aceest-fitness-test || true
+          docker rm aceest-fitness-test || true
+
+      - name: Save Docker image
+        if: success()
+        run: |
+          docker save ${{ env.DOCKER_IMAGE }}:ci-${{ github.sha }} | gzip > aceest-fitness-image.tar.gz
+
+      - name: Upload Docker image artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: aceest-fitness-image.tar.gz
+          retention-days: 1
+
+  # ==================== Integration Tests ====================
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: docker-build-and-smoke
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: |
+          docker load < aceest-fitness-image.tar.gz
+
+      - name: Run integration test suite
+        run: |
+          docker run -d --name test-app -p 8000:8000 ${{ env.DOCKER_IMAGE }}:ci-${{ github.sha }}
+          sleep 10
+          
+          # Extended integration tests
+          echo "Running extended integration tests..."
+          
+          # Test error handling
+          echo "Testing error handling..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/workouts \
+            -H 'Content-Type: application/json' \
+            -d '{"workout":"Test"}')
+          if [ "$STATUS" -ne 400 ]; then
+            echo "Expected 400 for missing duration, got $STATUS"
+            exit 1
+          fi
+          
+          # Test invalid category
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/workouts \
+            -H 'Content-Type: application/json' \
+            -d '{"category":"Invalid","workout":"Test","duration":10}')
+          if [ "$STATUS" -ne 400 ]; then
+            echo "Expected 400 for invalid category, got $STATUS"
+            exit 1
+          fi
+          
+          # Test content type validation
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/workouts \
+            -H 'Content-Type: text/plain' \
+            -d 'not json')
+          if [ "$STATUS" -ne 415 ]; then
+            echo "Expected 415 for invalid content type, got $STATUS"
+            exit 1
+          fi
+          
+          echo "All integration tests passed!"
+          docker stop test-app
+
+  # ==================== Docker Hub Push ====================
+  docker-push:
+    name: Push to Docker Hub
+    runs-on: ubuntu-latest
+    needs: [integration-tests, security]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: |
+          docker load < aceest-fitness-image.tar.gz
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          # Determine version tag
+          if [[ $GITHUB_REF == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          elif [[ $GITHUB_REF == refs/heads/main ]]; then
+            VERSION=latest
+          else
+            VERSION=${GITHUB_SHA::8}
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+
+      - name: Tag and push images
+        run: |
+          # Tag with version
+          docker tag ${{ env.DOCKER_IMAGE }}:ci-${{ github.sha }} \
+            ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.version }}
+          
+          # Tag with short SHA
+          docker tag ${{ env.DOCKER_IMAGE }}:ci-${{ github.sha }} \
+            ${{ env.DOCKER_IMAGE }}:sha-${{ steps.meta.outputs.short_sha }}
+          
+          # Push all tags
+          docker push ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.version }}
+          docker push ${{ env.DOCKER_IMAGE }}:sha-${{ steps.meta.outputs.short_sha }}
+          
+          # Push latest if main branch
+          if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            docker tag ${{ env.DOCKER_IMAGE }}:ci-${{ github.sha }} ${{ env.DOCKER_IMAGE }}:latest
+            docker push ${{ env.DOCKER_IMAGE }}:latest
+          fi
+
+      - name: Docker Hub description
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: ${{ env.DOCKER_IMAGE }}
+          short-description: "ACEest Fitness & Gym Tracker - DevOps CI/CD Demo"
+          readme-filepath: ./README.md
+        continue-on-error: true
+
+  # ==================== Deployment Notification ====================
+  notify:
+    name: Notify Deployment
+    runs-on: ubuntu-latest
+    needs: docker-push
+    if: success() && github.ref == 'refs/heads/main'
+    steps:
+      - name: Create deployment summary
+        run: |
+          echo "## 🚀 Deployment Success" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.DOCKER_IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Author:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- Docker image pushed to Docker Hub" >> $GITHUB_STEP_SUMMARY
+          echo "- Coverage reports available" >> $GITHUB_STEP_SUMMARY
+          echo "- Security scans completed" >> $GITHUB_STEP_SUMMARY
+
+  # ==================== Cleanup ====================
+  cleanup:
+    name: Cleanup Artifacts
+    runs-on: ubuntu-latest
+    needs: [docker-push]
+    if: always()
+    steps:
+      - name: Delete temporary artifacts
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: docker-image
+          failOnError: false
