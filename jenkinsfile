@@ -2,9 +2,8 @@ pipeline {
     agent any
 
     environment {
-        // Change this to your DockerHub repo (or Docker registry repo) if different
+       
         IMAGE_NAME = "2024tm93122/aceest-fitness"
-        // Optional: build context override (backend or repo root). We'll build backend image by default.
         BACKEND_DIR = "backend"
         BACKEND_DOCKERFILE = "backend/Dockerfile"
     }
@@ -13,10 +12,10 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout([$class: 'GitSCM',
-                    branches: [[name: '*/main']],                // change branch if needed
+                    branches: [[name: '*/main']],                
                     userRemoteConfigs: [[
                         url: 'https://github.com/2024tm93122/aceest-fitness.git',
-                        credentialsId: 'github-https-token'    // ensure this credential exists in Jenkins
+                        credentialsId: 'github-https-token'    
                     ]]
                 ])
             }
@@ -28,7 +27,7 @@ pipeline {
                     sh '''
                         set -e
 
-                        # Use repo backend folder (adapt if your project layout differs)
+                        # Use repo backend folder 
                         cd ${BACKEND_DIR}
 
                         # create virtualenv and activate
