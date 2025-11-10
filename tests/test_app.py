@@ -1,56 +1,165 @@
-import json
 import pytest
-from app.app import create_app
+import sys
+import os
 
-@pytest.fixture()
-def client():
-    app = create_app({"TESTING": True})
-    with app.test_client() as client:
-        yield client
+# Add parent directory to path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-def test_health_ok(client):
-    rv = client.get("/health")
-    assert rv.status_code == 200
-    assert rv.get_json()["status"] == "ok"
+from app import app as flask_app
 
-def test_add_workout_with_category(client):
-    payload = {"category": "Warm-up", "workout": "Stretching", "duration": 10}
-    rv = client.post("/workouts", data=json.dumps(payload), content_type="application/json")
-    assert rv.status_code == 201
-    data = rv.get_json()
-    assert data["entry"]["exercise"] == "Stretching"
-    assert data["category"] == "Warm-up"
+@pytest.fixture
+def app():
+    """Create and configure a test instance of the app."""
+    flask_app.config.update({
+        'TESTING': True,
+        'SECRET_KEY': 'test-secret-key'
+    })
+    yield flask_app
 
-def test_add_and_list_workouts(client):
-    rv = client.get("/workouts")
-    assert rv.status_code == 200
-    assert rv.get_json()["count"] == 0
+@pytest.fixture
+def client(app):
+    """A test client for the app."""
+    return app.test_client()
 
-    # Updated: include category or use default
-    payload = {"workout": "Running", "duration": 30}
-    rv = client.post("/workouts", data=json.dumps(payload), content_type="application/json")
-    assert rv.status_code == 201
-    data = rv.get_json()
-    assert data["entry"]["exercise"] == "Running"  # Changed from "workout" to "exercise"
-    assert data["entry"]["duration"] == 30
+@pytest.fixture
+def runner(app):
+    """A test runner for the app's Click commands."""
+    return app.test_cli_runner()
 
-    rv = client.get("/workouts")
-    assert rv.status_code == 200
-    data = rv.get_json()
-    assert data["count"] == 1
-
-def test_validation_errors(client):
-    rv = client.post("/workouts", data="not-json", content_type="text/plain")
-    assert rv.status_code == 415
-
-    rv = client.post("/workouts", json={"duration": 10})
-    assert rv.status_code == 400
+class TestHealthCheck:
+    """Test health check endpoint"""
     
-    rv = client.post("/workouts", json={"workout": "X"})
-    assert rv.status_code == 400
+    def test_health_endpoint(self, client):
+        """Test that health endpoint returns 200"""
+        response = client.get('/health')
+        assert response.status_code == 200
+        assert response.json['status'] == 'healthy'
 
-    rv = client.post("/workouts", json={"workout": "X", "duration": -5})
-    assert rv.status_code == 400
+class TestHomePage:
+    """Test home page functionality"""
     
-    rv = client.post("/workouts", json={"workout": "X", "duration": "abc"})
-    assert rv.status_code == 400
+    def test_index_page_loads(self, client):
+        """Test that index page loads successfully"""
+        response = client.get('/')
+        assert response.status_code == 200
+        assert b'ACEest Fitness' in response.data
+    
+    def test_index_contains_form(self, client):
+        """Test that index page contains workout form"""
+        response = client.get('/')
+        assert b'workout' in response.data.lower()
+        assert b'duration' in response.data.lower()
+
+class TestAddWorkout:
+    """Test add workout functionality"""
+    
+    def test_add_workout_success(self, client):
+        """Test adding a valid workout"""
+        response = client.post('/add_workout', data={
+            'workout': 'Push-ups',
+            'duration': '30'
+        }, follow_redirects=True)
+        assert response.status_code == 200
+        json_data = response.json
+        assert json_data['status'] == 'success'
+    
+    def test_add_workout_missing_fields(self, client):
+        """Test adding workout with missing fields"""
+        response = client.post('/add_workout', data={
+            'workout': 'Push-ups'
+        })
+        assert response.status_code == 400
+        json_data = response.json
+        assert json_data['status'] == 'error'
+    
+    def test_add_workout_invalid_duration(self, client):
+        """Test adding workout with invalid duration"""
+        response = client.post('/add_workout', data={
+            'workout': 'Push-ups',
+            'duration': 'invalid'
+        })
+        assert response.status_code == 400
+    
+    def test_add_workout_negative_duration(self, client):
+        """Test adding workout with negative duration"""
+        response = client.post('/add_workout', data={
+            'workout': 'Push-ups',
+            'duration': '-10'
+        })
+        assert response.status_code == 400
+    
+    def test_add_workout_zero_duration(self, client):
+        """Test adding workout with zero duration"""
+        response = client.post('/add_workout', data={
+            'workout': 'Push-ups',
+            'duration': '0'
+        })
+        assert response.status_code == 400
+
+class TestViewWorkouts:
+    """Test view workouts functionality"""
+    
+    def test_view_workouts_page(self, client):
+        """Test that view workouts page loads"""
+        response = client.get('/view_workouts')
+        assert response.status_code == 200
+    
+    def test_view_workouts_with_data(self, client):
+        """Test viewing workouts after adding data"""
+        # Add a workout first
+        client.post('/add_workout', data={
+            'workout': 'Squats',
+            'duration': '20'
+        })
+        
+        # View workouts
+        response = client.get('/view_workouts')
+        assert response.status_code == 200
+        assert b'Squats' in response.data
+
+class TestClearWorkouts:
+    """Test clear workouts functionality"""
+    
+    def test_clear_workouts(self, client):
+        """Test clearing all workouts"""
+        # Add a workout
+        client.post('/add_workout', data={
+            'workout': 'Running',
+            'duration': '45'
+        })
+        
+        # Clear workouts
+        response = client.post('/clear_workouts', follow_redirects=True)
+        assert response.status_code == 200
+
+class TestIntegration:
+    """Integration tests"""
+    
+    def test_full_workflow(self, client):
+        """Test complete workflow: add, view, clear"""
+        # Add multiple workouts
+        workouts = [
+            ('Push-ups', '30'),
+            ('Squats', '25'),
+            ('Running', '45')
+        ]
+        
+        for workout, duration in workouts:
+            response = client.post('/add_workout', data={
+                'workout': workout,
+                'duration': duration
+            })
+            assert response.status_code == 200
+        
+        # View workouts
+        response = client.get('/view_workouts')
+        assert response.status_code == 200
+        for workout, _ in workouts:
+            assert workout.encode() in response.data
+        
+        # Clear workouts
+        response = client.post('/clear_workouts', follow_redirects=True)
+        assert response.status_code == 200
+
+if __name__ == '__main__':
+    pytest.main([__file__, '-v'])
